@@ -1,0 +1,181 @@
+name: Alpha release runner
+
+on:
+  push:
+    branches:
+      - codex/release-runner-v1.0.20261120
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      APPLE_SIGNING_IDENTITY: "-"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64 / NSIS installer
+            runner: windows-latest
+            target: win-x64
+            script: package:ci:tauri:win:x64
+            triple: x86_64-pc-windows-msvc
+            extension: exe
+          - name: Windows arm64 / NSIS installer
+            runner: windows-11-arm
+            target: win-arm64
+            script: package:ci:tauri:win:arm64
+            triple: aarch64-pc-windows-msvc
+            extension: exe
+          - name: macOS arm64 / DMG
+            runner: macos-15
+            target: mac-arm64
+            script: package:ci:tauri:mac:arm64
+            triple: aarch64-apple-darwin
+            extension: dmg
+          - name: macOS x64 / DMG
+            runner: macos-15-intel
+            target: mac-x64
+            script: package:ci:tauri:mac:x64
+            triple: x86_64-apple-darwin
+            extension: dmg
+          - name: Linux x64 / AppImage
+            runner: ubuntu-24.04
+            target: linux-x64
+            script: package:ci:tauri:linux:x64
+            triple: x86_64-unknown-linux-gnu
+            extension: AppImage
+          - name: Linux arm64 / AppImage
+            runner: ubuntu-24.04-arm
+            target: linux-arm64
+            script: package:ci:tauri:linux:arm64
+            triple: aarch64-unknown-linux-gnu
+            extension: AppImage
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: Mutantcat-Working-Group/Alpha
+          ref: cc0e7bc48860f2b357036eb0cd449317cb55b056
+          persist-credentials: false
+          clean: true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Configure pnpm store path
+        id: pnpm-store
+        shell: bash
+        run: |
+          store_root="$HOME/.local/share/pnpm/store"
+          echo "PNPM_CONFIG_STORE_DIR=$store_root" >> "$GITHUB_ENV"
+          store_path=$(PNPM_CONFIG_STORE_DIR="$store_root" pnpm store path --silent)
+          echo "path=$store_path" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-${{ matrix.target }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-
+
+      - name: Install (immutable)
+        run: pnpm install --frozen-lockfile
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add the ${{ matrix.triple }} target
+        run: rustup target add ${{ matrix.triple }}
+
+      - name: Install the Linux bundle libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf musl-tools
+
+      - name: Create self-signed code-signing certificate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'mutantcat-code-signing.pfx'
+          $password = 'mutantcat'
+          $cert = New-SelfSignedCertificate `
+            -Subject 'CN=Mutantcat Working Group, O=Mutantcat Working Group, C=CN' `
+            -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -KeyUsage DigitalSignature `
+            -Type CodeSigningCert `
+            -KeyExportPolicy Exportable `
+            -KeyLength 2048 `
+            -HashAlgorithm SHA256 `
+            -NotAfter (Get-Date).AddYears(10)
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString -String $password -Force -AsPlainText) | Out-Null
+          "PFX_PATH=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SIGN_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $signtool = $null
+          foreach ($kit in (Get-ChildItem -Path 'C:\Program Files (x86)\Windows Kits\10\bin' -Directory | Sort-Object Name -Descending)) {
+            $candidate = Join-Path $kit.FullName 'x64\signtool.exe'
+            if (Test-Path $candidate) { $signtool = $candidate; break }
+          }
+          if (-not $signtool) { throw 'signtool.exe not found in the Windows SDK' }
+          "SIGNTOOL_PATH=$signtool" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Package ${{ matrix.target }}
+        run: pnpm --dir apps/desktop run ${{ matrix.script }}
+
+      - name: Verify the ad-hoc macOS signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          images=(apps/desktop/.desktop-build/targets/${{ matrix.target }}/artifacts/*.${{ matrix.extension }})
+          if [ "${#images[@]}" -eq 0 ]; then
+            echo "::error::no disk image to verify"
+            exit 1
+          fi
+          codesign --verify --verbose=2 "${images[0]}"
+          MOUNT="$(mktemp -d)"
+          hdiutil attach "${images[0]}" -nobrowse -readonly -mountpoint "${MOUNT}" >/dev/null
+          trap 'hdiutil detach "${MOUNT}" >/dev/null || true' EXIT
+          if [ ! -L "${MOUNT}/Applications" ]; then
+            echo "::error::${images[0]} has no /Applications link"
+            exit 1
+          fi
+          bundles=("${MOUNT}"/*.app)
+          if [ "${#bundles[@]}" -ne 1 ]; then
+            echo "::error::expected one .app bundle in ${images[0]}, found ${#bundles[@]}"
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "${bundles[0]}"
+          if ! codesign -dv "${bundles[0]}" 2>&1 | grep -q 'Signature=adhoc'; then
+            echo "::error::the app inside ${images[0]} is not ad-hoc signed"
+            exit 1
+          fi
+          hdiutil detach "${MOUNT}" >/dev/null
+          trap - EXIT
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpha-${{ matrix.target }}
+          path: apps/desktop/.desktop-build/targets/${{ matrix.target }}/artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
